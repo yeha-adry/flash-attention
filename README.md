@@ -6,7 +6,20 @@ following paper.
 Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré  
 Paper: https://arxiv.org/abs/2205.14135  
 IEEE Spectrum [article](https://spectrum.ieee.org/mlperf-rankings-2022) about our submission to the MLPerf 2.0 benchmark using FlashAttention.
+
+### Figure 1
 ![FlashAttention](assets/flashattn_banner.jpg)
+
+**Left:**
+- FlashAttention uses tiling to prevent materialization of the large $N \times N$ attention matrix (dotted box) on (relatively) slow GPU HBM.
+- In the outer loops (red arrows), FlashAttention loops through blocks of the **K** and **V** matrices and loads them to fast on-chip SRAM. 
+- In each block, FlashAttention loops over blocks of **Q** matrix (blue arrows), loading them to SRAM, and writing the output of the attention computation back to HBM.
+
+
+**Right:**
+- Speedup over the PyTorch implementation of attention on GPT-2.
+- FlashAttention does not read and write the large $N \times N$ attention matrix to HBM, resulting in an $7.6\times$ speedup on the attention computation.
+
 
 ## Usage
 
