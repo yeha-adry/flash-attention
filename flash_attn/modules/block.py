@@ -18,6 +18,21 @@ try:
 except ImportError:
     dropout_add_layer_norm = None
 
+try:
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
+except ImportError:
+    dropout_add_layer_norm_parallel_residual = None
+
+try:
+    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
+except ImportError:
+    RMSNorm, dropout_add_rms_norm = None
+
+try:
+    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
+except ImportError:
+    dropout_add_rms_norm_parallel_residual = None
+
 
 class Block(nn.Module):
 
@@ -64,8 +79,10 @@ class Block(nn.Module):
             self.norm2 = norm_cls(dim)
 
         if self.fused_dropout_add_ln:
-            assert dropout_add_layer_norm is not None, 'dropout_add_ln is not installed'
-            assert isinstance(self.norm1, nn.LayerNorm) and isinstance(self.dropout1, nn.Dropout)
+            assert dropout_add_layer_norm is not None, 'dropout_layer_norm is not installed'
+            assert dropout_add_rms_norm is not None, 'dropout_layer_norm is not installed'
+            assert (isinstance(self.norm1, (nn.LayerNorm, RMSNorm))
+                    and isinstance(self.dropout1, nn.Dropout))
 
         # TD [2023-01-07]: TODO: During training, if sequence_parallel is False and dropout != 0.0,
         # then the input to each worker in the tensor parallel group will be different.
@@ -88,6 +105,9 @@ class Block(nn.Module):
                 for p in self.norm2.parameters():
                     p._shared_params = True
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None,
                 mixer_subset=None, mixer_kwargs=None):
         r"""Pass the input through the encoder layer.
@@ -99,6 +119,8 @@ class Block(nn.Module):
                 before applying the query projection. Useful for e.g., ViT where we only care
                 about the CLS token in the last layer.
         """
+        fused_add_norm_fn = (dropout_add_rms_norm if isinstance(self.norm1, RMSNorm)
+                             else dropout_add_layer_norm)
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_path1(self.dropout1(hidden_states))
@@ -114,7 +136,7 @@ class Block(nn.Module):
                         hidden_states.shape[:-1], device=hidden_states.device,
                         dtype=hidden_states.dtype)
                     )
-                hidden_states, residual = dropout_add_layer_norm(
+                hidden_states, residual = fused_add_norm_fn(
                     hidden_states, residual, self.norm1.weight, self.norm1.bias,
                     self.dropout1.p if self.training else 0.0, self.norm1.eps,
                     rowscale=rowscale1, prenorm=True, residual_in_fp32=self.residual_in_fp32
@@ -141,7 +163,7 @@ class Block(nn.Module):
                             hidden_states.shape[:-1], device=hidden_states.device,
                             dtype=hidden_states.dtype)
                         )
-                    hidden_states, residual = dropout_add_layer_norm(
+                    hidden_states, residual = fused_add_norm_fn(
                         hidden_states, residual, self.norm2.weight, self.norm2.bias,
                         self.dropout2.p if self.training else 0.0, self.norm2.eps,
                         rowscale=rowscale2, prenorm=True, residual_in_fp32=self.residual_in_fp32
@@ -165,7 +187,7 @@ class Block(nn.Module):
                     rowscale1 = self.drop_path1(torch.ones(
                         mixer_out.shape[:-1], device=mixer_out.device, dtype=mixer_out.dtype)
                     )
-                hidden_states = dropout_add_layer_norm(
+                hidden_states = fused_add_norm_fn(
                     mixer_out, hidden_states, self.norm1.weight, self.norm1.bias,
                     self.dropout1.p if self.training else 0.0, self.norm1.eps,
                     rowscale=rowscale1, prenorm=False
@@ -184,7 +206,7 @@ class Block(nn.Module):
                         rowscale2 = self.drop_path2(torch.ones(
                             mlp_out.shape[:-1], device=mlp_out.device, dtype=mlp_out.dtype)
                         )
-                    hidden_states = dropout_add_layer_norm(
+                    hidden_states = fused_add_norm_fn(
                         mlp_out, hidden_states, self.norm2.weight, self.norm2.bias,
                         self.dropout2.p if self.training else 0.0, self.norm2.eps,
                         rowscale=rowscale2, prenorm=False
@@ -214,7 +236,6 @@ class ParallelBlock(nn.Module):
         super().__init__()
         self.tied_norm = tied_norm
         self.fused_dropout_add_ln = fused_dropout_add_ln
-        assert not self.fused_dropout_add_ln, 'This is not implemented for ParallelBlock yet'
         self.residual_in_fp32 = residual_in_fp32
         if mixer_cls is None:
             mixer_cls = partial(MHA, num_heads=dim // 64)
@@ -229,8 +250,10 @@ class ParallelBlock(nn.Module):
             self.norm2 = norm_cls(dim)
 
         if self.fused_dropout_add_ln:
-            assert dropout_add_layer_norm is not None, 'dropout_add_ln is not installed'
-            assert isinstance(self.norm1, nn.LayerNorm) and isinstance(self.dropout1, nn.Dropout)
+            assert dropout_add_layer_norm_parallel_residual is not None, 'dropout_layer_norm is not installed'
+            assert dropout_add_rms_norm_parallel_residual is not None, 'dropout_layer_norm is not installed'
+            assert (isinstance(self.norm1, (nn.LayerNorm, RMSNorm))
+                    and isinstance(self.dropout1, nn.Dropout))
 
         # TD [2023-01-07]: TODO: During training, if sequence_parallel is False and dropout != 0.0,
         # then the input to each worker in the tensor parallel group will be different.
@@ -262,19 +285,33 @@ class ParallelBlock(nn.Module):
             hidden_states2: the output of the previous MLP layer (if None, will use hidden_states1).
             residual.
         """
-        dropped1 = self.dropout1(hidden_states1)
-        # For the very 1st block, we only want 1 dropout, not two different dropouts
-        if hidden_states2 is not None:
-            dropped2 = self.dropout2(hidden_states2)
-            residual = ((residual + dropped1 + dropped2)
-                        if residual is not None else dropped1 + dropped2)
+        fused_add_norm_fn = (dropout_add_rms_norm_parallel_residual
+                             if isinstance(self.norm1, RMSNorm)
+                             else dropout_add_layer_norm_parallel_residual)
+        if not self.fused_dropout_add_ln:
+            dropped1 = self.dropout1(hidden_states1)
+            # For the very 1st block, we only want 1 dropout, not two different dropouts
+            if hidden_states2 is not None:
+                dropped2 = self.dropout2(hidden_states2)
+                residual = ((residual + dropped1 + dropped2)
+                            if residual is not None else dropped1 + dropped2)
+            else:
+                residual = (residual + dropped1) if residual is not None else dropped1
+            hidden_states1 = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
+            hidden_states2 = (self.norm2(residual.to(dtype=self.norm2.weight.dtype))
+                              if not self.tied_norm else hidden_states1)
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
         else:
-            residual = (residual + dropped1) if residual is not None else dropped1
-        hidden_states1 = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
-        hidden_states2 = (self.norm2(residual.to(dtype=self.norm2.weight.dtype))
-                          if not self.tied_norm else hidden_states1)
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+            weight2, bias2 = ((self.norm2.weight, self.norm2.bias)
+                              if not self.tied_norm else (None, None))
+            hidden_states1, hidden_states2, residual = fused_add_norm_fn(
+                hidden_states1, hidden_states2, residual, self.norm1.weight, self.norm1.bias,
+                weight2, bias2, self.dropout1.p if self.training else 0.0, self.norm1.eps,
+                prenorm=True, residual_in_fp32=self.residual_in_fp32
+            )
+            if self.tied_norm:
+                hidden_states2 = hidden_states1
         if mixer_kwargs is None:
             mixer_kwargs = {}
         hidden_states1 = self.mixer(hidden_states1, **mixer_kwargs)

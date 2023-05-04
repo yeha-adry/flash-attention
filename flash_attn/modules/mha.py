@@ -55,7 +55,7 @@ class FlashSelfAttention(nn.Module):
             assert flash_attn_qkvpacked_func is not None, 'FlashAttention Triton is not installed'
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.dropout_p = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
         self.triton = triton
 
     def forward(self, qkv, causal=None, cu_seqlens=None, max_seqlen=None):
@@ -84,13 +84,13 @@ class FlashSelfAttention(nn.Module):
             assert max_seqlen is not None
             assert isinstance(max_seqlen, int)
             return flash_attn_unpadded_qkvpacked_func(
-                qkv, cu_seqlens, max_seqlen, self.dropout_p if self.training else 0.0,
+                qkv, cu_seqlens, max_seqlen, self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
             )
         else:
             batch_size, seqlen = qkv.shape[0], qkv.shape[1]
             # Triton version doesn't support dropout
-            if self.triton and (self.dropout_p == 0 or not self.training):
+            if self.triton and (self.drop.p == 0 or not self.training):
                 output = flash_attn_qkvpacked_func(qkv, None, causal, self.softmax_scale)
             else:
                 qkv = rearrange(qkv, 'b s ... -> (b s) ...')
@@ -98,7 +98,7 @@ class FlashSelfAttention(nn.Module):
                 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                                         device=qkv.device)
                 output = flash_attn_unpadded_qkvpacked_func(
-                    qkv, cu_seqlens, max_seqlen, self.dropout_p if self.training else 0.0,
+                    qkv, cu_seqlens, max_seqlen, self.drop.p if self.training else 0.0,
                     softmax_scale=self.softmax_scale, causal=causal
                 )
                 output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
@@ -124,7 +124,7 @@ class FlashCrossAttention(nn.Module):
             assert flash_attn_kvpacked_func is not None, 'FlashAttention Triton is not installed'
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.dropout_p = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
         self.triton = triton
 
     def forward(self, q, kv, causal=None, cu_seqlens=None, max_seqlen=None,
@@ -156,14 +156,14 @@ class FlashCrossAttention(nn.Module):
             assert isinstance(max_seqlen, int)
             return flash_attn_unpadded_kvpacked_func(
                 q, kv, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k,
-                self.dropout_p if self.training else 0.0,
+                self.drop.p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
             )
         else:
             batch_size, seqlen_q = q.shape[0], q.shape[1]
             seqlen_k = kv.shape[1]
             assert kv.shape[0] == batch_size and kv.shape[3] == q.shape[2] and kv.shape[4] == q.shape[3]
-            if self.triton and (self.dropout_p == 0.0 or not self.training):  # Triton version doesn't support dropout
+            if self.triton and (self.drop.p == 0.0 or not self.training):  # Triton version doesn't support dropout
                 output = flash_attn_kvpacked_func(q, kv, None, causal, self.softmax_scale)
             else:
                 q = rearrange(q, 'b s ... -> (b s) ...')
@@ -174,7 +174,7 @@ class FlashCrossAttention(nn.Module):
                                             dtype=torch.int32, device=kv.device)
                 output = flash_attn_unpadded_kvpacked_func(
                     q, kv, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-                    self.dropout_p if self.training else 0.0,
+                    self.drop.p if self.training else 0.0,
                     softmax_scale=self.softmax_scale, causal=causal
                 )
                 output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
@@ -195,7 +195,7 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.dropout_p = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
 
     def forward(self, qkv, causal=None, key_padding_mask=None):
         """Implements the multihead softmax attention.
@@ -224,7 +224,7 @@ class SelfAttention(nn.Module):
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
-        attention_drop = F.dropout(attention, self.dropout_p if self.training else 0.0)
+        attention_drop = self.drop(attention)
         output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
         return output
 
@@ -243,7 +243,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.dropout_p = attention_dropout
+        self.drop = nn.Dropout(attention_dropout)
 
     def forward(self, q, kv, causal=None, key_padding_mask=None):
         """Implements the multihead softmax attention.
@@ -276,7 +276,7 @@ class CrossAttention(nn.Module):
             # TD [2022-09-30]: Adding is faster than masked_fill_ (idk why, just better kernel I guess)
             scores = scores + causal_mask.to(dtype=scores.dtype)
         attention = torch.softmax(scores, dim=-1, dtype=v.dtype)
-        attention_drop = F.dropout(attention, self.dropout_p if self.training else 0.0)
+        attention_drop = self.drop(attention)
         output = torch.einsum('bhts,bshd->bthd', attention_drop, v)
         return output
 
@@ -416,6 +416,22 @@ class MHA(nn.Module):
                                                      attention_dropout=dropout)
         self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, fused_ft_kernel=True):
+        dtype = self.out_proj.weight.dtype if dtype is None else dtype
+        device = self.out_proj.weight.device
+        if not fused_ft_kernel:
+            return torch.empty(batch_size, max_seqlen, 2, self.num_heads, self.head_dim,
+                               dtype=dtype, device=device)
+        else:
+            assert dtype in [torch.float16, torch.bfloat16, torch.float32]
+            packsize = 4 if dtype == torch.float32 else 8
+            assert self.head_dim % packsize == 0
+            k_cache = torch.empty(batch_size, self.num_heads, self.head_dim // packsize, max_seqlen,
+                                  packsize, dtype=dtype, device=device)
+            v_cache = torch.empty(batch_size, self.num_heads, max_seqlen, self.head_dim,
+                                  dtype=dtype, device=device)
+            return k_cache, v_cache
+
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)
         """
@@ -490,12 +506,18 @@ class MHA(nn.Module):
                 else:
                     assert inference_params.fused_ft_kernel
                     assert ft_attention is not None
+                    batch_start = inference_params.batch_size_offset
+                    batch_end = batch_start + qkv.shape[0]
+                    k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
+                    lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
+                                          if inference_params.lengths_per_sample is not None else None)
                     context = ft_attention.single_query_attention(
                         *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                        *inference_params.key_value_memory_dict[self.layer_idx],
-                        inference_params.lengths_per_sample, inference_params.sequence_len_offset,
+                        k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
+                        lengths_per_sample, inference_params.sequence_len_offset,
                         self.rotary_emb_dim,
-                        not self.rotary_emb.interleaved  # neox_rotary_style
+                        # neox_rotary_style
+                        (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                     )
                     context = rearrange(context, 'b h d -> b 1 h d')
         else:
@@ -604,12 +626,18 @@ class ParallelMHA(nn.Module):
             else:
                 assert inference_params.fused_ft_kernel
                 assert ft_attention is not None
+                batch_start = inference_params.batch_size_offset
+                batch_end = batch_start + qkv.shape[0]
+                k_cache, v_cache = inference_params.key_value_memory_dict[self.layer_idx]
+                lengths_per_sample = (inference_params.lengths_per_sample[batch_start:batch_end]
+                                      if inference_params.lengths_per_sample is not None else None)
                 context = ft_attention.single_query_attention(
                     *rearrange(qkv, 'b 1 three h d -> b three h d').unbind(dim=1),
-                    *inference_params.key_value_memory_dict[self.layer_idx],
-                    inference_params.lengths_per_sample, inference_params.sequence_len_offset,
-                    self.rotary_emb_dim,
-                    not self.rotary_emb.interleaved  # neox_rotary_style
+                    k_cache[batch_start:batch_end], v_cache[batch_start:batch_end],
+                    lengths_per_sample, inference_params.sequence_len_offset,
+                    self.rotary_emb_dim, inference_params.sequence_len_offset,
+                    # neox_rotary_style
+                    (not self.rotary_emb.interleaved) if self.rotary_emb_dim > 0 else True
                 )
                 context = rearrange(context, 'b h d -> b 1 h d')
         if seqlen is None:

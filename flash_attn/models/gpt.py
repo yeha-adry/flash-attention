@@ -16,8 +16,9 @@ from transformers import GPT2Config
 
 from einops import rearrange
 
+from flash_attn.ops.activations import sqrelu_fwd
 from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import Mlp, FusedMLP, ParallelFusedMLP
+from flash_attn.modules.mlp import Mlp, GatedMlp, FusedMLP, ParallelFusedMLP
 from flash_attn.modules.block import Block, ParallelBlock
 from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
@@ -38,10 +39,24 @@ except ImportError:
     dropout_add_layer_norm = None
 
 try:
-    from flash_attn.ops.triton.mlp import FusedDenseSqreluDense, sqrelu_fwd
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
+except ImportError:
+    dropout_add_layer_norm_parallel_residual = None
+
+try:
+    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
+except ImportError:
+    RMSNorm, dropout_add_rms_norm = None
+
+try:
+    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
+except ImportError:
+    dropout_add_rms_norm_parallel_residual = None
+
+try:
+    from flash_attn.ops.triton.mlp import FusedDenseSqreluDense
 except ImportError:
     FusedDenseSqreluDense = None
-    sqrelu_fwd = None
 
 
 logger = logging.getLogger(__name__)
@@ -85,10 +100,11 @@ def create_mixer_cls(config, layer_idx=None, process_group=None, device=None, dt
 
 def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtype=None):
     factory_kwargs = {'device': device, 'dtype': dtype}
-    inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
+    mlp_fc1_bias = getattr(config, 'mlp_fc1_bias', True)
+    mlp_fc2_bias = getattr(config, 'mlp_fc2_bias', True)
     fused_mlp = getattr(config, 'fused_mlp', False)
     if fused_mlp:
-        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu']
+        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu', 'sqrelu']
     fused_dense_sqrelu_dense = getattr(config, 'fused_dense_sqrelu_dense', False)
     if fused_dense_sqrelu_dense:
         assert config.activation_function == 'sqrelu', ('fused_dense_sqrelu_dense only '
@@ -97,17 +113,25 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
     if process_group is not None:
         assert fused_mlp, 'Tensor Parallel is only implemented for FusedMLP'
     if not fused_mlp and not fused_dense_sqrelu_dense:
-        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu', 'sqrelu']
-        if config.activation_function == 'relu':
-            activation = partial(F.relu, inplace=True)
-        elif config.activation_function == 'sqrelu':
-            assert sqrelu_fwd is not None, 'sqrelu_fwd is not implemented'
-            activation = sqrelu_fwd
+        assert config.activation_function in ['gelu_new', 'gelu_fast', 'gelu_approx', 'relu',
+                                              'sqrelu', 'glu', 'swiglu', 'geglu']
+        if config.activation_function in ['glu', 'swiglu', 'geglu']:
+            activation = (F.sigmoid if config.activation_function == 'glu'
+                          else (F.silu if config.activation_function == 'swiglu'
+                                else F.gelu))
+            mlp_cls = partial(GatedMlp, hidden_features=config.n_inner, activation=activation,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
         else:
-            approximate = ('tanh' if config.activation_function
-                           in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'none')
-            activation=partial(F.gelu, approximate=approximate)
-        mlp_cls = partial(Mlp, hidden_features=inner_dim, activation=activation, **factory_kwargs)
+            if config.activation_function == 'relu':
+                activation = partial(F.relu, inplace=True)
+            elif config.activation_function == 'sqrelu':
+                activation = sqrelu_fwd
+            else:
+                approximate = ('tanh' if config.activation_function
+                            in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'none')
+                activation=partial(F.gelu, approximate=approximate)
+            mlp_cls = partial(Mlp, hidden_features=config.n_inner, activation=activation,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias, **factory_kwargs)
     else:
         mlp_checkpoint_lvl = getattr(config, 'mlp_checkpoint_lvl', 0)
         # mlp_checkpoint_lvl could be a list, which contains the checkpoint_lvl for each layer
@@ -118,17 +142,18 @@ def create_mlp_cls(config, layer_idx=None, process_group=None, device=None, dtyp
             if FusedMLP is None:
                 raise ImportError('fused_dense is not installed')
             activation = ('gelu_approx' if config.activation_function
-                          in ['gelu_new', 'gelu_fast', 'gelu_approx'] else 'relu')
+                          in ['gelu_new', 'gelu_fast', 'gelu_approx'] else config.activation_function)
             mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
             parallel_kwargs = ({'process_group': process_group,
                                 'sequence_parallel': getattr(config, 'sequence_parallel', True)}
                                if process_group is not None else {})
-            mlp_cls = partial(mlp_cls, hidden_features=inner_dim, activation=activation,
+            mlp_cls = partial(mlp_cls, hidden_features=config.n_inner, activation=activation,
                               checkpoint_lvl=mlp_checkpoint_lvl,
+                              bias1=mlp_fc1_bias, bias2=mlp_fc2_bias,
                               **parallel_kwargs, **factory_kwargs)
         elif fused_dense_sqrelu_dense:
             assert FusedDenseSqreluDense is not None
-            mlp_cls = partial(FusedDenseSqreluDense, hidden_features=inner_dim,
+            mlp_cls = partial(FusedDenseSqreluDense, hidden_features=config.n_inner,
                               checkpoint_lvl=mlp_checkpoint_lvl, **factory_kwargs)
         else:
             raise RuntimeError('MLP type not supported')
@@ -140,7 +165,9 @@ def create_block(config, layer_idx=None, process_group=None, device=None, dtype=
     sequence_parallel = getattr(config, 'sequence_parallel', True)
     mixer_cls = create_mixer_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
     mlp_cls = create_mlp_cls(config, layer_idx, process_group=process_group, **factory_kwargs)
-    norm_cls = partial(nn.LayerNorm, eps=config.layer_norm_epsilon, **factory_kwargs)
+    use_rms_norm = getattr(config, 'rms_norm', False)
+    norm_cls = partial(nn.LayerNorm if not use_rms_norm else RMSNorm,
+                       eps=config.layer_norm_epsilon, **factory_kwargs)
     # TD [2022-07-30]: Force residual in fp32, seems to make fp16 training more stable
     residual_in_fp32 = getattr(config, 'residual_in_fp32', False)
     resid_dropout1 = config.resid_pdrop if layer_idx is None or layer_idx > 0 else config.embd_pdrop
@@ -247,7 +274,7 @@ class GPTModel(GPTPreTrainedModel):
         self.process_group = process_group
         self.sequence_parallel = getattr(config, 'sequence_parallel', True)
         assert config.activation_function in ['gelu', 'gelu_new', 'gelu_fast', 'gelu_approx',
-                                              'relu', 'sqrelu']
+                                              'relu', 'sqrelu', 'glu', 'swiglu', 'geglu']
         pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
         vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple)
                       * pad_vocab_size_multiple)
@@ -255,6 +282,7 @@ class GPTModel(GPTPreTrainedModel):
         self.residual_in_fp32 = getattr(config, 'residual_in_fp32', False)
         # These 2 options are for OPT-350m
         self.prenorm = getattr(config, 'prenorm', True)
+        use_rms_norm = getattr(config, 'rms_norm', False)
         word_embed_proj_dim = getattr(config, 'word_embed_proj_dim', None)
         # For GPT-J, GPT-NeoX
         self.parallel_block = getattr(config, 'parallel_block', False)
@@ -282,12 +310,15 @@ class GPTModel(GPTPreTrainedModel):
                                      for i in range(config.num_hidden_layers)])
 
         self.fused_dropout_add_ln = getattr(config, 'fused_dropout_add_ln', False)
-        if self.fused_dropout_add_ln and dropout_add_layer_norm is None:
-            raise ImportError('dropout_add_layer_norm is not installed')
+        if self.fused_dropout_add_ln:
+            if ((not self.parallel_block and dropout_add_layer_norm is None)
+                or (self.parallel_block and dropout_add_layer_norm_parallel_residual is None)):
+                raise ImportError('dropout_layer_norm is not installed')
         if self.prenorm:
             self.drop_f = nn.Dropout(config.resid_pdrop)
-            self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon,
-                                    **factory_kwargs)
+            norm_cls = nn.LayerNorm if not use_rms_norm else RMSNorm
+            self.ln_f = norm_cls(config.hidden_size, eps=config.layer_norm_epsilon,
+                                 **factory_kwargs)
         if process_group is not None:
             for p in self.ln_f.parameters():
                 # Mark the norm parameters as "shared_params" so that we sync their values at init.
@@ -303,6 +334,10 @@ class GPTModel(GPTPreTrainedModel):
     def tie_weights(self):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return {i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+                for i, layer in enumerate(self.layers)}
 
     def forward(self, input_ids, position_ids=None, inference_params=None):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
@@ -340,13 +375,19 @@ class GPTModel(GPTPreTrainedModel):
                                 if residual is not None else dropped + dropped2)
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
             else:
-                assert not self.parallel_block
                 # Set prenorm=False here since we don't need the residual
-                hidden_states = dropout_add_layer_norm(
-                    hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
-                    self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
-                    residual_in_fp32=self.residual_in_fp32
-                )
+                if not self.parallel_block:
+                    hidden_states = dropout_add_layer_norm(
+                        hidden_states, residual, self.ln_f.weight, self.ln_f.bias,
+                        self.drop_f.p if self.training else 0.0, self.ln_f.eps, prenorm=False,
+                        residual_in_fp32=self.residual_in_fp32
+                    )
+                else:
+                    hidden_states, _ = dropout_add_layer_norm_parallel_residual(
+                        hidden_states, hidden_states2, residual, self.ln_f.weight, self.ln_f.bias,
+                        None, None, self.drop_f.p if self.training else 0.0, self.ln_f.eps,
+                        prenorm=False, residual_in_fp32=self.residual_in_fp32
+                    )
         return hidden_states
 
 
@@ -389,20 +430,28 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None):
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.transformer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype,
+                                                         **kwargs)
+
+    def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False):
         """
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
+            last_token_only: whether to return the logit for the last token only,
+                of shape (batch_size, vocab_size)
         """
         hidden_states = self.transformer(input_ids, position_ids=position_ids,
                                          inference_params=inference_params)
+        if last_token_only:
+            hidden_states = hidden_states[:, -1]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
         lm_logits = self.lm_head(hidden_states)
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
-            lm_logits = rearrange(lm_logits, '(n b) s d -> b s (n d)', b=hidden_states.shape[0])
+            lm_logits = rearrange(lm_logits, '(n b) ... d -> b ... (n d)', b=hidden_states.shape[0])
         CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
         return CausalLMOutput(logits=lm_logits)
 
@@ -492,18 +541,25 @@ def combine_state_dicts_tp(state_dicts, config):
     inner_dim = config.n_inner if config.n_inner is not None else 4 * config.hidden_size
     assert inner_dim % world_size == 0
 
-    # The word embeddings from Megatron are weird, for each shard only the first
+    # Sometimes the word embeddings are sharded on the 0th dim, sometimes on the 1st dim.
     # vocab_size // world_size coordinates are nonzero.
     def combine_word_embeddings(state_dicts, state_dict, key):
-        assert all(s[key].shape[0] == vocab_size for s in state_dicts)
-        state_dict[key] = torch.cat([s[key][:vocab_size // world_size] for s in state_dicts], dim=0)
-
-    def combine_dim(state_dicts, state_dict, key, dim=-1):
+        dim = 0 if state_dicts[0][key].shape[0] == vocab_size // world_size else 1
         state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
 
+    def combine_dim(state_dicts, state_dict, key, dim=-1):
+        if key in state_dict:
+            state_dict[key] = torch.cat([s[key] for s in state_dicts], dim=dim)
+
     def combine_qkv_headdim(state_dicts, state_dict, key):
-        xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
-        state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+        if key in state_dict:
+            xs = [rearrange(s[key], '(three d) ... -> three d ...', three=3) for s in state_dicts]
+            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'three d ... -> (three d) ...')
+
+    def combine_gated_mlp(state_dicts, state_dict, key):
+        if key in state_dict:
+            xs = [rearrange(s[key], '(two d) ... -> two d ...', two=2) for s in state_dicts]
+            state_dict[key] = rearrange(torch.cat(xs, dim=1), 'two d ... -> (two d) ...')
 
     state_dict = state_dicts[0].copy()  # don't modify state_dict[0] inplace
     combine_word_embeddings(state_dicts, state_dict, 'transformer.embeddings.word_embeddings.weight')
@@ -511,11 +567,13 @@ def combine_state_dicts_tp(state_dicts, config):
         combine_word_embeddings(state_dicts, state_dict, 'lm_head.weight')
     if 'transformer.embeddings.position_embeddings.weight' in state_dict:
         combine_dim(state_dicts, state_dict, 'transformer.embeddings.position_embeddings.weight', -1)
+    mlp_combine_fn = (combine_gated_mlp if config.activation_function in ['glu', 'swiglu', 'geglu']
+                      else partial(combine_dim, dim=0))
     for i in range(config.num_hidden_layers):
         combine_qkv_headdim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.Wqkv.weight')
         combine_qkv_headdim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.Wqkv.bias')
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mixer.out_proj.weight', -1)
-        combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.weight', 0)
+        mlp_combine_fn(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.weight')
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc1.bias', 0)
         combine_dim(state_dicts, state_dict, f'transformer.layers.{i}.mlp.fc2.weight', -1)
     return state_dict
@@ -583,7 +641,8 @@ def remap_state_dict_megatron(state_dict, config):
     word_embeddings = state_dict.pop('transformer.embedding.word_embeddings.weight')
     # It's possible that vocab_size is padded to be a multiple of 8, for example.
     pad_vocab_size_multiple = getattr(config, 'pad_vocab_size_multiple', 1)
-    vocab_size = (math.ceil(config.vocab_size / pad_vocab_size_multiple) * pad_vocab_size_multiple)
+    vocab_size = (math.ceil(word_embeddings.shape[0] / pad_vocab_size_multiple)
+                  * pad_vocab_size_multiple)
     state_dict['transformer.embeddings.word_embeddings.weight'] = F.pad(
         word_embeddings, (0, 0, 0, vocab_size - word_embeddings.shape[0])
     )
